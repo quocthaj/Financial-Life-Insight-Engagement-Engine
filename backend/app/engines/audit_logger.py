@@ -2,6 +2,12 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
+def _value(item: Any, key: str, default: Any = None) -> Any:
+    if isinstance(item, dict):
+        return item.get(key, default)
+    return getattr(item, key, default)
+
+
 def _find_policy_decision(
     candidate_id: str, policy_decisions: List[Any]
 ) -> Optional[Any]:
@@ -89,21 +95,21 @@ def build_audit_entries(
             challenge = output_item.get("challenge")
 
             if obs:
-                obs_text = obs.text
+                obs_text = _value(obs, "text")
             if nudge:
-                nudge_text = nudge.text
+                nudge_text = _value(nudge, "text")
             if obs_safety:
-                obs_safety_passed = obs_safety.passed
-                obs_safety_violations = obs_safety.violations
+                obs_safety_passed = _value(obs_safety, "passed")
+                obs_safety_violations = _value(obs_safety, "violations", [])
             if nudge_safety:
-                nudge_safety_passed = nudge_safety.passed
-                nudge_safety_violations = nudge_safety.violations
+                nudge_safety_passed = _value(nudge_safety, "passed")
+                nudge_safety_violations = _value(nudge_safety, "violations", [])
 
             if challenge:
-                chal_title = challenge.title
-                chal_desc = challenge.description
-                chal_criteria = challenge.criteria
-                chal_safety_passed = challenge.passed_safety_check
+                chal_title = _value(challenge, "title")
+                chal_desc = _value(challenge, "description")
+                chal_criteria = _value(challenge, "criteria")
+                chal_safety_passed = _value(challenge, "passed_safety_check")
 
                 for key in [
                     "challenge_safety_title",
@@ -112,7 +118,7 @@ def build_audit_entries(
                 ]:
                     safety = output_item.get(key)
                     if safety:
-                        chal_safety_violations.extend(safety.violations)
+                        chal_safety_violations.extend(_value(safety, "violations", []))
 
             # Compute final status
             all_passed = (

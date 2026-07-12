@@ -1,8 +1,10 @@
+import os
 from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, List, Optional
 
 from app.engines.llm_client import LLMClient
-from app.data.customer_registry import get_customer_profile, get_customer_features
+from app.data.customer_data_provider import get_customer_data_provider, CustomerDataProvider
+from app.data.pipeline_repository import create_pipeline_run, save_audit_entries
 from app.agents.persona_verification import verify_against_persona_registry
 from app.models.schemas import CustomerFullProfile, Nudge
 from app.engines.data_checker import check_data_availability
@@ -10,6 +12,7 @@ from app.engines.fact_pattern_engine import generate_facts
 from app.engines.policy_engine import evaluate_policies
 from app.engines.safety_engine import validate_observation, validate_nudge
 from app.engines.engagement_engine import generate_challenges
+from app.engines.audit_logger import build_audit_entries
 
 
 @dataclass
@@ -57,18 +60,125 @@ class FinancialMirrorAgent:
     - Return an execution trace visible to the UI.
     """
 
-    def __init__(self, llm_client: Optional[LLMClient] = None) -> None:
+    def __init__(
+        self,
+        llm_client: Optional[LLMClient] = None,
+        data_provider: Optional[CustomerDataProvider] = None,
+    ) -> None:
         self.llm_client = llm_client or LLMClient()
+        self.data_provider = data_provider or get_customer_data_provider()
         self.planner_mode = "governed_dynamic_llm_assisted"
 
     def load_customer_data(self, customer_key: str) -> Dict[str, Any]:
-        customer_profile = get_customer_profile(customer_key)
-        available_features = get_customer_features(customer_key)
+        allow_fallback = os.getenv("ALLOW_MOCK_FALLBACK", "false").strip().lower() == "true"
+        fallback_used = False
+
+        customer_profile = self.data_provider.get_customer_profile(customer_key)
+        source = self.data_provider.source
+
+        if customer_profile is None and allow_fallback and source != "mock":
+            # Fall back to mock if Supabase has no data for this key
+            from app.data.customer_data_provider import MockCustomerDataProvider
+            mock_provider = MockCustomerDataProvider()
+            customer_profile = mock_provider.get_customer_profile(customer_key)
+            available_features = mock_provider.get_customer_features(customer_key)
+            fallback_used = True
+            source = "mock"
+        else:
+            available_features = self.data_provider.get_customer_features(customer_key)
 
         return {
             "customer_key": customer_key,
             "customer_profile": customer_profile,
             "available_features": available_features,
+            "source": source,
+            "fallback_used": fallback_used,
+        }
+
+    def _model_used(self) -> Dict[str, Any]:
+        return {
+            "provider": self.llm_client.provider,
+            "model_name": self.llm_client.model_name,
+            "prompt_version": self.llm_client.prompt_version,
+            "llm_used": self.llm_client.provider != "mock",
+        }
+
+    def _loaded_customer_result(self, loaded_customer: Dict[str, Any]) -> Dict[str, Any]:
+        customer_profile = loaded_customer.get("customer_profile") or {}
+        profile = customer_profile.get("profile", {})
+        return {
+            "customer_key": loaded_customer["customer_key"],
+            "customer_id": profile.get("customer_id", loaded_customer["customer_key"]),
+            "available_features": loaded_customer["available_features"],
+            "source": loaded_customer.get("source", "mock"),
+            "fallback_used": loaded_customer.get("fallback_used", False),
+        }
+
+    def _persist_run(
+        self,
+        customer_key: str,
+        loaded_customer: Dict[str, Any],
+        actual_outcome: str,
+        model_used: Dict[str, Any],
+        execution_trace: List[AgentTraceItem],
+        llm_decisions: List[Dict[str, Any]],
+        facts: List[Any],
+        policy_results: List[Any],
+        outputs_for_audit: List[Dict[str, Any]],
+        safety_retry_attempts: List[Dict[str, Any]],
+        verification: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        customer_profile = loaded_customer.get("customer_profile") or {}
+        profile = customer_profile.get("profile", {})
+        customer_id = profile.get("customer_id", customer_key)
+        trace_list = [asdict(item) for item in execution_trace]
+        fact_dicts = [
+            fact.model_dump(mode="json") if hasattr(fact, "model_dump") else fact
+            for fact in facts
+        ]
+
+        persist_run_result = create_pipeline_run(
+            customer_id=customer_id,
+            customer_key=customer_key,
+            data_source=loaded_customer.get("source", "mock"),
+            final_status=actual_outcome,
+            model_used=model_used,
+            execution_trace=trace_list,
+            llm_decisions=llm_decisions,
+            facts_count=len(fact_dicts),
+            safety_retry_attempts=safety_retry_attempts,
+            verification=verification,
+        )
+
+        audit_result = None
+        if fact_dicts:
+            audit_entries = build_audit_entries(
+                candidates=fact_dicts,
+                facts=fact_dicts,
+                policy_decisions=policy_results,
+                outputs_with_challenges=outputs_for_audit,
+                generation_mode="llm_agent",
+                llm_prompt_version=model_used.get("prompt_version", "unknown"),
+                model_name=model_used.get("model_name", "unknown"),
+            )
+            for entry in audit_entries:
+                entry["final_status"] = actual_outcome
+            audit_result = save_audit_entries(
+                run_id=persist_run_result.run_id,
+                customer_id=customer_id,
+                validated_entries=audit_entries,
+            )
+
+        error = persist_run_result.error
+        if audit_result and audit_result.error:
+            error = "; ".join([part for part in [error, audit_result.error] if part])
+
+        return {
+            "persisted": persist_run_result.persisted and (audit_result.persisted if audit_result else True),
+            "run_id": persist_run_result.run_id,
+            "error": error,
+            "skipped_reason": persist_run_result.skipped_reason,
+            "audit_entry_count": audit_result.audit_entry_count if audit_result else 0,
         }
 
     def build_base_plan(self) -> List[AgentPlanStep]:
@@ -154,6 +264,8 @@ class FinancialMirrorAgent:
 
         loaded_customer = self.load_customer_data(customer_key)
         customer_profile = loaded_customer["customer_profile"]
+        if customer_profile is None:
+            raise ValueError(f"Customer '{customer_key}' not found in {loaded_customer.get('source', 'mock')} data source.")
 
         display_name = (
             customer_profile.get("profile", {}).get("display_name")
@@ -164,13 +276,16 @@ class FinancialMirrorAgent:
         execution_trace.append(
             AgentTraceItem(
                 step_id="load_customer_data",
-                tool="customer_registry",
+                tool="customer_data_provider",
                 status="completed",
-                summary=f"Loaded persona data for {display_name}.",
+                summary=f"Loaded persona data for {display_name} from {loaded_customer.get('source', 'mock')}.",
                 decision="Continue to data availability check.",
                 next_action="check_data_availability",
                 metadata={
                     "customer_key": customer_key,
+                    "customer_id": customer_profile.get("profile", {}).get("customer_id", customer_key),
+                    "data_source": loaded_customer.get("source", "mock"),
+                    "fallback_used": loaded_customer.get("fallback_used", False),
                     "available_features_count": len(loaded_customer.get("available_features", [])),
                 },
             )
@@ -264,19 +379,11 @@ class FinancialMirrorAgent:
                 base_plan=[asdict(step) for step in base_plan],
                 execution_trace=[asdict(item) for item in execution_trace],
                 llm_decisions=llm_decisions,
-                model_used={
-                    "provider": self.llm_client.provider,
-                    "model_name": self.llm_client.model_name,
-                    "prompt_version": self.llm_client.prompt_version,
-                    "llm_used": self.llm_client.provider != "mock",
-                },
+                model_used=self._model_used(),
                 final_status=actual_outcome,
                 verification=verification,
                 result={
-                    "loaded_customer": {
-                        "customer_key": loaded_customer["customer_key"],
-                        "available_features": loaded_customer["available_features"],
-                    },
+                    "loaded_customer": self._loaded_customer_result(loaded_customer),
                     "data_check": data_check_result.model_dump(mode="json"),
                     "facts": [],
                     "policy": {
@@ -381,19 +488,11 @@ class FinancialMirrorAgent:
                 base_plan=[asdict(step) for step in base_plan],
                 execution_trace=[asdict(item) for item in execution_trace],
                 llm_decisions=llm_decisions,
-                model_used={
-                    "provider": self.llm_client.provider,
-                    "model_name": self.llm_client.model_name,
-                    "prompt_version": self.llm_client.prompt_version,
-                    "llm_used": self.llm_client.provider != "mock",
-                },
+                model_used=self._model_used(),
                 final_status=actual_outcome,
                 verification=verification,
                 result={
-                    "loaded_customer": {
-                        "customer_key": loaded_customer["customer_key"],
-                        "available_features": loaded_customer["available_features"],
-                    },
+                    "loaded_customer": self._loaded_customer_result(loaded_customer),
                     "data_check": data_check_result.model_dump(mode="json"),
                     "facts": [],
                     "policy": {
@@ -525,19 +624,11 @@ class FinancialMirrorAgent:
                 base_plan=[asdict(step) for step in base_plan],
                 execution_trace=[asdict(item) for item in execution_trace],
                 llm_decisions=llm_decisions,
-                model_used={
-                    "provider": self.llm_client.provider,
-                    "model_name": self.llm_client.model_name,
-                    "prompt_version": self.llm_client.prompt_version,
-                    "llm_used": self.llm_client.provider != "mock",
-                },
+                model_used=self._model_used(),
                 final_status=actual_outcome,
                 verification=verification,
                 result={
-                    "loaded_customer": {
-                        "customer_key": loaded_customer["customer_key"],
-                        "available_features": loaded_customer["available_features"],
-                    },
+                    "loaded_customer": self._loaded_customer_result(loaded_customer),
                     "data_check": data_check_result.model_dump(mode="json"),
                     "facts": [
                         fact.model_dump(mode="json") if hasattr(fact, "model_dump") else fact
@@ -697,19 +788,11 @@ class FinancialMirrorAgent:
                 base_plan=[asdict(step) for step in base_plan],
                 execution_trace=[asdict(item) for item in execution_trace],
                 llm_decisions=llm_decisions,
-                model_used={
-                    "provider": self.llm_client.provider,
-                    "model_name": self.llm_client.model_name,
-                    "prompt_version": self.llm_client.prompt_version,
-                    "llm_used": self.llm_client.provider != "mock",
-                },
+                model_used=self._model_used(),
                 final_status=actual_outcome,
                 verification=verification,
                 result={
-                    "loaded_customer": {
-                        "customer_key": loaded_customer["customer_key"],
-                        "available_features": loaded_customer["available_features"],
-                    },
+                    "loaded_customer": self._loaded_customer_result(loaded_customer),
                     "data_check": data_check_result.model_dump(mode="json"),
                     "facts": [
                         fact.model_dump(mode="json") if hasattr(fact, "model_dump") else fact
@@ -787,19 +870,11 @@ class FinancialMirrorAgent:
                 base_plan=[asdict(step) for step in base_plan],
                 execution_trace=[asdict(item) for item in execution_trace],
                 llm_decisions=llm_decisions,
-                model_used={
-                    "provider": self.llm_client.provider,
-                    "model_name": self.llm_client.model_name,
-                    "prompt_version": self.llm_client.prompt_version,
-                    "llm_used": self.llm_client.provider != "mock",
-                },
+                model_used=self._model_used(),
                 final_status=actual_outcome,
                 verification=verification,
                 result={
-                    "loaded_customer": {
-                        "customer_key": loaded_customer["customer_key"],
-                        "available_features": loaded_customer["available_features"],
-                    },
+                    "loaded_customer": self._loaded_customer_result(loaded_customer),
                     "data_check": data_check_result.model_dump(mode="json"),
                     "facts": [
                         fact.model_dump(mode="json") if hasattr(fact, "model_dump") else fact
@@ -1087,19 +1162,11 @@ class FinancialMirrorAgent:
                     base_plan=[asdict(step) for step in base_plan],
                     execution_trace=[asdict(item) for item in execution_trace],
                     llm_decisions=llm_decisions,
-                    model_used={
-                        "provider": self.llm_client.provider,
-                        "model_name": self.llm_client.model_name,
-                        "prompt_version": self.llm_client.prompt_version,
-                        "llm_used": self.llm_client.provider != "mock",
-                    },
+                    model_used=self._model_used(),
                     final_status=actual_outcome,
                     verification=verification,
                     result={
-                        "loaded_customer": {
-                            "customer_key": loaded_customer["customer_key"],
-                            "available_features": loaded_customer["available_features"],
-                        },
+                        "loaded_customer": self._loaded_customer_result(loaded_customer),
                         "data_check": data_check_result.model_dump(mode="json"),
                         "facts": [
                             fact.model_dump(mode="json") if hasattr(fact, "model_dump") else fact
@@ -1294,25 +1361,71 @@ class FinancialMirrorAgent:
                 )
             )
 
+        model_used = self._model_used()
+        trace_list = [asdict(item) for item in execution_trace]
+        outputs_for_audit = []
+        for out in challenges_outputs:
+            fact_payload = out.get("fact") or {}
+            fact_id = fact_payload.get("fact_id")
+            if not fact_id:
+                continue
+            challenge = out.get("challenge") or {}
+            outputs_for_audit.append({
+                "fact_id": fact_id,
+                "candidate_id": fact_id,
+                "observation": {"text": out.get("observation")},
+                "nudge": {"text": out.get("nudge")},
+                "observation_safety": {"passed": True, "violations": []},
+                "nudge_safety": {"passed": True, "violations": []},
+                "challenge": {
+                    "title": challenge.get("title"),
+                    "description": challenge.get("description"),
+                    "criteria": challenge.get("criteria"),
+                    "passed_safety_check": challenge.get("passed_safety_check"),
+                } if challenge else None,
+                "challenge_safety_title": out.get("challenge_safety_title"),
+                "challenge_safety_desc": out.get("challenge_safety_desc"),
+                "challenge_safety_criteria": out.get("challenge_safety_criteria"),
+            })
+        for out in safety_failed_outputs:
+            fact_payload = out.get("fact") or {}
+            fact_id = fact_payload.get("fact_id")
+            if not fact_id:
+                continue
+            outputs_for_audit.append({
+                "fact_id": fact_id,
+                "candidate_id": fact_id,
+                "observation": {"text": out.get("observation")},
+                "nudge": {"text": out.get("nudge")},
+                "observation_safety": {"passed": False, "violations": out.get("safety_violations", [])},
+                "nudge_safety": {"passed": False, "violations": out.get("safety_violations", [])},
+                "challenge": None,
+            })
+        persistence_info = self._persist_run(
+            customer_key=customer_key,
+            loaded_customer=loaded_customer,
+            actual_outcome=actual_outcome,
+            model_used=model_used,
+            execution_trace=execution_trace,
+            llm_decisions=llm_decisions,
+            facts=facts,
+            policy_results=policy_results,
+            outputs_for_audit=outputs_for_audit,
+            safety_retry_attempts=safety_retry_attempts,
+            verification=verification,
+        )
+
         return AgentRunResult(
             agent_goal=goal,
             planner_mode=self.planner_mode,
             base_plan=[asdict(step) for step in base_plan],
-            execution_trace=[asdict(item) for item in execution_trace],
+            execution_trace=trace_list,
             llm_decisions=llm_decisions,
-            model_used={
-                "provider": self.llm_client.provider,
-                "model_name": self.llm_client.model_name,
-                "prompt_version": self.llm_client.prompt_version,
-                "llm_used": self.llm_client.provider != "mock",
-            },
+            model_used=model_used,
             final_status=actual_outcome,
             verification=verification,
             result={
-                "loaded_customer": {
-                    "customer_key": loaded_customer["customer_key"],
-                    "available_features": loaded_customer["available_features"],
-                },
+                "loaded_customer": self._loaded_customer_result(loaded_customer),
                 "data_check": data_check_result.model_dump(mode="json"),
                 "facts": [
                     fact.model_dump(mode="json") if hasattr(fact, "model_dump") else fact
@@ -1339,5 +1452,7 @@ class FinancialMirrorAgent:
                 "safety_passed_outputs": safety_passed_outputs,
                 "safety_failed_outputs": safety_failed_outputs,
                 "challenges": challenges_outputs,
+                "persistence": persistence_info,
             },
         )
+
