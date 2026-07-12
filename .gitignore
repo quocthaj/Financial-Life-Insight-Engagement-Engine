@@ -1,0 +1,64 @@
+# ============================================================
+# Financial Mirror — .gitignore
+# ============================================================
+
+# ─── Security: API keys and secrets ─────────────────────────
+backend/.env
+.env
+.env.*
+*.env
+!.env.example
+
+# ─── Internal docs (pitches, arch notes, task board) ────────
+docs/
+
+# ─── Python ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+*.egg-info/
+dist/
+build/
+
+# ─── Node / Next.js ─────────────────────────────────────────
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env
+frontend/.env.*
+frontend/.env.local
+frontend/.env.production
+
+# ─── IDE ────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Local audit / mock DB ──────────────────────────────────
+backend/app/data/audit_db.json
+
+# ─── Misc ───────────────────────────────────────────────────
+*.log
+*.sqlite3
+*.db
