@@ -307,6 +307,7 @@ def run_pipeline(payload: Dict[str, str]):
         )
         outputs_legacy.append({
             "fact_id": f_id,
+            "candidate_id": f_id,
             "policy_decision": out["policy_result"],
             "observation": obs_obj,
             "nudge": nudge_obj,
@@ -374,6 +375,7 @@ def run_pipeline(payload: Dict[str, str]):
         )
         outputs_legacy.append({
             "fact_id": f_id,
+            "candidate_id": f_id,
             "policy_decision": out["policy_result"],
             "observation": obs_obj,
             "nudge": nudge_obj,
@@ -386,7 +388,7 @@ def run_pipeline(payload: Dict[str, str]):
         chal = c.get("challenge")
         if chal:
             challenges_legacy.append({
-                "based_on_nudge": chal.get("based_on_nudge"),
+                "based_on_nudge": c.get("fact", {}).get("fact_id") if c.get("fact") else (chal.get("based_on_nudge").replace("nudge_", "") if chal.get("based_on_nudge") else None),
                 "challenge": chal,
                 "passed_safety_check": chal.get("passed_safety_check"),
                 "safety_violations": {

@@ -1,5 +1,6 @@
 import os
 os.environ["LLM_PROVIDER"] = "mock"
+os.environ["DATA_SOURCE"] = "mock"
 os.environ["ENV"] = "development"
 
 from fastapi.testclient import TestClient
